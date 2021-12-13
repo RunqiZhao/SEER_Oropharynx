@@ -1,0 +1,860 @@
+---
+title: "Analysis of treatment disparities for Oropharynx cancer patients among the SEER database populations"
+author: "Runqi Zhao, Masanao Yajima"
+date: "12/5/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message=FALSE, warning=FALSE)
+pacman::p_load("tidyverse","magrittr","readxl","caret","glmnet","mediation","randomForest","rstanarm","bayesplot","arm","scales","sjPlot","predtools","dplyr","DescTools", "GGally","gridExtra")
+```
+
+## Abstract
+
+In this study, we explore oropharynx cancer patient population from the SEER database to investigate whether there is disparities in receiving standard treatment defined by NCCN Guidelines. We find that even after accounting for patients' AJCC Stages, age and whether they have an insurance, we see gender, race, and income Level will affect whether the given therapy follows guidelines. Since standard treatments have significant influence on the survival of a patient, this result suggests concerning systematic issues that require further investigation.
+
+
+\newpage
+
+
+## Introduction
+
+[Talk about the disparty of patient treatment elsewhere.]
+[_____________________] Please add more details.
+
+The Surveillance, Epidemiology, and End Results (SEER) Program is an authoritative source for cancer statistics in the United States. The SEER registries collect data on patient demographics, primary tumor site, tumor morphology, stage at diagnosis, and first course of treatment, and they follow up with patients for vital status.
+
+[_____________________] Please add more details about oropharynx cancer.
+
+The oropharynx includes the base of the tongue, tonsils, soft palate, and posterior pharyngeal wall. Here we combined three sites together for analysis.
+
+
+Oropharyngeal cancer that is p16-positive (ie, HPV-mediated) is different disease than p16-negative cancer and the suggested therapies are different for AJCC Stage III when T Stage is 1 and N Stage is 1.
+
+## Data Processing
+
+This SEER data set cited from Anand Devaiah, Pratima Agarwal and Jacob Bloom contains cancer care statistics for people in 4 different states with 7 different head and neck cancer types. We have the cancer type, the stage, the patient's social background, socioeconomic status, and their types of treatments.
+
+This report focus on Oropharynx cancer that constitute of three sub-sites: Tongue, Tonsil, Oropharynx. AJCC Stage is one of the most important index to identify the standard therapy. In this step, we refer to CS Extension code to assign AJCC Stage for patients without AJCC Stage information. According the NCCN Clinical Practice Guidelines(Version 1.2020), we defined the standard therapy for each stage. Processing details are attached in appendix. 
+
+In this data set, approximate 12.2% patients don't receive standard therapy.
+
+```{r}
+seer<-read.csv("SEER File 2.csv")
+
+seer %<>% subset(CS.tumor.size..2004.2015. != "Blank(s)") # AJCC is blank too
+# oropharynx <- subset(seer, Site.recode.ICD.O.3.WHO.2008 == "Oropharynx")
+oropharynx <- subset(seer, Site.recode.ICD.O.3.WHO.2008 %in% c("Tongue","Tonsil","Oropharynx"))
+
+# table(as.factor(oropharynx$Derived.AJCC.Stage.Group..7th.ed..2010.2015.))
+```
+
+```{r}
+#### TNM Stage
+# T Stage
+
+#   -`-1`: Error, 100, 550, OBSOLETE DATA RETAINED V0200, 100 to T3, 550 to [T3]/Decided by Size
+#   -`0`: T0  No evidence of primary tumor  
+#   -`1`: T1  Tumor 2 cm or less in greatest dimension  
+#   -`2`: T2  Tumor more than 2 cm but not more than 4 cm in greatest dimension  
+#   -`3`: T3  Tumor more than 4 cm in greatest dimension or extension to lingual surface of epiglottis (Extension Code)  
+#   -`4`: T4a  Moderately advanced local disease. Tumor invades the larynx, extrinsic muscle of tongue, medial pterygoid, hard palate, or mandible (Extension Code)  
+#   -`5`: T4b  Very advanced local disease. Tumor invades lateral pterygoid muscle, pterygoid plates, lateral nasopharynx, or skull base or encases carotid artery (Extension Code)  
+#   -`6`: T4NOS
+
+#   - `99`: Deside by size
+#   - `100`: Deside by extesion
+
+# Tumor Size
+oropharynx$CS.tumor.size..2004.2015. %<>% as.numeric()
+
+oropharynx["T Code"] <- ifelse(oropharynx$CS.tumor.size..2004.2015.%in%seq(1,20),1,
+                       ifelse(oropharynx$CS.tumor.size..2004.2015.%in%seq(21,40),2,
+                              ifelse(oropharynx$CS.tumor.size..2004.2015.%in%seq(41,989),3,100)))
+
+oropharynx$CS.extension..2004.2015. %<>% as.numeric()
+
+# Extension Code
+oropharynx$Extension <- ifelse(oropharynx$CS.extension..2004.2015. %in% c(530,531,533,535,538,540),3, 
+                               ifelse(oropharynx$CS.extension..2004.2015. %in% c(610,630,635,650,675,700,705),4, 
+                                      ifelse(oropharynx$CS.extension..2004.2015. %in% c(708,710,715,718,720,750,770,800,810),5, 
+                                             ifelse(oropharynx$CS.extension..2004.2015. == 950,0,
+                                                    ifelse(oropharynx$CS.extension..2004.2015. == 815, 6,
+                                                           ifelse(oropharynx$CS.extension..2004.2015. == 100, 3, 99))))))
+
+oropharynx["Final_T_Code"] <- ifelse(oropharynx$Extension == 99, oropharynx$`T Code`, oropharynx$Extension)
+
+oropharynx$Final_T_Code %<>% as.numeric()
+# unique(oropharynx$Final_T_Code)
+
+# N Stage
+oropharynx$N_Stage <- ifelse(oropharynx$CS.lymph.nodes..2004.2015. == "000", "No Nodal Involvement", ifelse(oropharynx$CS.lymph.nodes..2004.2015. == "999", "NX", "Nodal Involvement"))
+
+# M Stage
+oropharynx$M_Stage <- ifelse(oropharynx$CS.mets.at.dx..2004.2015. %in% c("00", "99"), "M0", "M1")
+```
+
+```{r}
+#### Sign AJCC Stage
+
+# unique(oropharynx$Derived.AJCC.Stage.Group..7th.ed..2010.2015.)
+oropharynx$AJCC_Stage <- ifelse(oropharynx$Derived.AJCC.Stage.Group..7th.ed..2010.2015. != "Blank(s)", oropharynx$Derived.AJCC.Stage.Group..7th.ed..2010.2015., 
+                                ifelse(oropharynx$M_Stage == "M1", "IVC", 
+                                       ifelse(oropharynx$Final_T_Code == 0, "IVA",
+                                              ifelse(oropharynx$Final_T_Code == 1 & oropharynx$N_Stage == "No Nodal Involvement", "I", 
+                                                     ifelse(oropharynx$Final_T_Code == 1 & oropharynx$N_Stage == "NX", "UNK Stage", 
+                                                            ifelse(oropharynx$Final_T_Code == 1 & oropharynx$N_Stage == "Nodal Involvement", "III/IV_1", 
+                                                                   ifelse(oropharynx$Final_T_Code == 2 & oropharynx$N_Stage == "No Nodal Involvement", "II", 
+                                                                          ifelse(oropharynx$Final_T_Code == 2 & oropharynx$N_Stage == "NX", "UNK Stage", 
+                                                                                 ifelse(oropharynx$Final_T_Code == 2 & oropharynx$N_Stage == "Nodal Involvement", "III/IV_2", 
+                                                                                        ifelse(oropharynx$Final_T_Code == 3 & oropharynx$N_Stage == "NX", "UNK Stage", 
+                                                                                               ifelse(oropharynx$Final_T_Code == 3 & oropharynx$N_Stage != "NX", "III/IV", 
+                                                                                                      ifelse(oropharynx$Final_T_Code == 4 & oropharynx$N_Stage == "NX", "UNK Stage",
+                                                                                                             ifelse(oropharynx$Final_T_Code == 4 & oropharynx$N_Stage != "NX", "III/IV",
+                                                                                                                    ifelse(oropharynx$Final_T_Code == 5, "IVB", NA))))))))))))))
+# blanks <- subset(oropharynx, Derived.AJCC.Stage.Group..7th.ed..2010.2015. == "Blank(s)")
+
+```
+
+```{r}
+oropharynx <- subset(oropharynx, !AJCC_Stage %in% c("UNK Stage", "IVNOS", "III/IV_1", "III/IV_2", "III/IV"))
+oropharynx <- oropharynx[-which(is.na(oropharynx$AJCC_Stage)), ]
+# table(as.factor(oropharynx$AJCC_Stage))
+```
+
+```{r}
+### Standard Therapy
+# unique(oropharynx$Radiation.recode)
+# unique(oropharynx$Reason.no.cancer.directed.surgery)
+# unique(oropharynx$Chemotherapy.recode..yes..no.unk.)
+
+# Radiation None/Recommended
+# Surgery Not recommended/Recommended but Not Performed/Performed
+oropharynx %<>% subset(Reason.no.cancer.directed.surgery != "Unknown; death certificate; or autopsy only (2003+)")
+# Chemotherapy Yes/No(Unknown)
+
+oropharynx$Radiation <- ifelse(oropharynx$Radiation.recode == "None/Unknown", "None/Unknown", 
+                               ifelse(oropharynx$Radiation.recode == "Refused (1988+)", "Refused", "Recommended"))
+
+oropharynx$Surgery <- ifelse(oropharynx$Reason.no.cancer.directed.surgery %in% c("Not recommended","Not recommended, contraindicated due to other cond; autopsy only (1973-2002)"), "Not recommended", 
+                             ifelse(oropharynx$Reason.no.cancer.directed.surgery %in% c("Recommended but not performed, patient refused", "Recommended but not performed, unknown reason", "Not performed, patient died prior to recommended surgery"), "Not Performed", "Recommended" ))
+
+oropharynx$Chemotherapy <- ifelse(oropharynx$Chemotherapy.recode..yes..no.unk. == "No/Unknown", "No/Unknown", "Yes")
+```
+
+```{r}
+# Stage I: Radiation|Surgery
+StageI <- oropharynx %>% subset(AJCC_Stage == "I")
+StageI$Standard_Therapy <- ifelse(StageI$Radiation != "None/Unknown"|StageI$Surgery != "Not recommended", 1, 0)
+
+# Stage II: Radiation|Surgery
+StageII <- oropharynx %>% subset(AJCC_Stage == "II")
+StageII$Standard_Therapy <- ifelse(StageII$Radiation != "None/Unknown"|StageII$Surgery != "Not recommended", 1, 0)
+
+# Stage III: T1(removed, need hpv test information)
+# Stage III: T2: Radiation & Chemotherapy
+# Stage III: T3: (Radiation&Chemotherapy)|Surgery
+oropharynx$AJCC_Stage <- ifelse(oropharynx$AJCC_Stage != "III/IV_1", oropharynx$AJCC_Stage, 
+                                ifelse(oropharynx$CS.lymph.nodes..2004.2015. == "180", "III", 
+                                       ifelse(oropharynx$CS.lymph.nodes..2004.2015. == "700", "IVB", ifelse(oropharynx$CS.lymph.nodes..2004.2015. %in% c("290", "190"), "IVA", "III/IV_1"))))
+
+
+oropharynx$AJCC_Stage <- ifelse(oropharynx$AJCC_Stage != "III/IV_2", oropharynx$AJCC_Stage, 
+                                ifelse(oropharynx$CS.lymph.nodes..2004.2015. == "180", "III", 
+                                       ifelse(oropharynx$CS.lymph.nodes..2004.2015. == "700", "IVB", ifelse(oropharynx$CS.lymph.nodes..2004.2015. %in% c("290", "190", "490", "600"), "IVA", "III/IV_2"))))
+
+StageIII_T2 <- oropharynx %>% subset(AJCC_Stage == "III"&Final_T_Code == 2)
+StageIII_T2$Standard_Therapy <- ifelse(StageIII_T2$Radiation != "None/Unknown" & StageIII_T2$Chemotherapy != "No/Unknown", 1, 0)
+
+StageIII_T3 <- oropharynx %>% subset(AJCC_Stage == "III"&Final_T_Code == 3)
+StageIII_T3$Standard_Therapy <- ifelse((StageIII_T3$Radiation != "None/Unknown" & StageIII_T3$Chemotherapy != "No/Unknown")|StageIII_T3$Surgery != "Not recommended", 1, 0)
+
+# Stage III/IV: (Radiation&Chemotherapy)|Surgery
+StageIII_IV <- oropharynx %>% subset(AJCC_Stage %in% c("III", "III/IV", "IVA", "IVB"))
+StageIII_IV$Standard_Therapy <- ifelse((StageIII_IV$Radiation != "None/Unknown" & StageIII_IV$Chemotherapy != "No/Unknown")|StageIII_IV$Surgery != "Not recommended", 1, 0)
+
+StageIVC <- oropharynx %>% subset(AJCC_Stage == "IVC")
+# unique(StageIVC$SEER.cause.specific.death.classification)
+# unique(StageIVC$Vital.status.recode..study.cutoff.used.)
+# table(StageIVC$Vital.status.recode..study.cutoff.used.)
+StageIVC$Standard_Therapy <- ifelse(StageIVC$Radiation != "None/Unknown"|StageIVC$Chemotherapy != "No/Unknown"|StageIVC$Surgery != "Not recommended", 1, 0)
+
+# Combine All Stages
+oropharynx <- as.data.frame(rbind(StageI, StageII, StageIII_T2, StageIII_T3, StageIII_IV, StageIVC))
+```
+
+## Exploratory data analysis
+
+In EDA part, we looked at the AJCC Stage, Gender, Race, Region, Insurance and Age. Here we only look at the AJCC Stage, Race and Region. Other EDA are attached in appendix.
+
+```{r}
+# select variables
+# names(oropharynx)
+oropharynx <- oropharynx[,c(2:5, 19, 21, 24:25, 27:35, 38:45)]
+colnames(oropharynx) <- c("Sex", "Year", "Registry", "County", "Cause_of_Death", "Vital_Status", "Race", "Age", "Insurance",  "Education_9th_Grade", "Education_High_School", "Education_Bachelors", "Below_Poverty", "Unemployed", "Median_Household_Income", "Language_Isolation",  "Subsite", "T_Stage", "N_Stage", "M_Stage", "AJCC_Stage", "Radiation", "Surgery", "Chemotherapy", "Standard_Therapy")
+```
+
+```{r}
+# Sex
+oropharynx$Sex <- factor(oropharynx$Sex, levels = c("Male", "Female"),  labels = c("Male", "Female"))
+# Race
+oropharynx$Race <- gsub("Non-Hispanic ","", oropharynx$Race)
+oropharynx$Race <- factor(oropharynx$Race, levels = c("White", "Black", "Asian or Pacific Islander", "Hispanic (All Races)", "Unknown Race", "American Indian/Alaska Native"), labels = c("White", "Black", "Asian or Pacific Islander", "Hispanic (All Races)", "Unknown Race", "American Indian/Alaska Native"))
+# Insurance
+oropharynx$Insurance <- ifelse(oropharynx$Insurance %in% c("Insured/No specifics", "Insured", "Any Medicaid"), "Insured", "Uninsured")
+oropharynx$Insurance <- factor(oropharynx$Insurance, levels = c("Insured", "Uninsured"), labels = c("Insured", "Uninsured"))
+# Registry
+oropharynx$Registry <- as.factor(oropharynx$Registry)
+# Region
+oropharynx$Region <- ifelse(oropharynx$Registry == "Connecticut - 1975+", "Connecticut",
+                            ifelse(oropharynx$Registry %in% c("Atlanta (Metropolitan) - 1975+", "Greater Georgia - 2000+", "Rural Georgia - 1992+"), "Georgia", ifelse(oropharynx$Registry == "Alaska Natives - 1992+", "Alaska", "California")))
+oropharynx$Region <- factor(oropharynx$Region, levels = c("California", "Georgia", "Connecticut", "Alaska"))
+# Cause of Death
+oropharynx$Cause_of_Death <- as.factor(oropharynx$Cause_of_Death)
+oropharynx$Vital_Status <- factor(oropharynx$Vital_Status, levels = c("Dead", "Alive"), labels = c("Dead", "Alive"))
+oropharynx$Subsite <- as.factor(oropharynx$Subsite)
+oropharynx$AJCC_Stage <- as.factor(oropharynx$AJCC_Stage)
+oropharynx$T_Stage <- factor(oropharynx$T_Stage, levels = c(0,1,2,3,4,5,6), labels = c("T0", "T1", "T2", "T3", "T4a", "T4b", "T4NOS"))
+oropharynx$M_Stage <- factor(oropharynx$M_Stage, levels = c("M0", "M1"), labels = c("M0", "M1"))
+oropharynx$N_Stage <- factor(oropharynx$N_Stage, levels = c("No Nodal Involvement", "Nodal Involvement", "NX"), labels = c("No Nodal Involvement", "Nodal Involvement", "NX"))
+
+oropharynx$Standard_Therapy <- factor(oropharynx$Standard_Therapy, levels = c(0,1), labels = c("Not Standard", "Standard"))
+oropharynx$Radiation <- factor(oropharynx$Radiation, levels = c("None/Unknown", "Refused", "Recommended"), labels = c("None/Unknown", "Refused", "Recommended"))
+oropharynx$Chemotherapy <- factor(oropharynx$Chemotherapy, levels = c("No/Unknown", "Yes"), labels = c("No/Unknown", "Yes"))
+oropharynx$Surgery  <- factor(oropharynx$Surgery, levels = c("Not recommended", "Not Performed", "Recommended"), labels = c("Not recommended", "Not Performed", "Recommended"))
+
+# "Education_9th_Grade", "Education_High_School", "Education_Bachelors", "Below_Poverty", "Unemployed", "Median_Household_Income", "Language_Isolation" -- pct at 10% scale
+oropharynx$Education_9th_Grade <- as.numeric(oropharynx$Education_9th_Grade)/1000
+oropharynx$Education_High_School <- as.numeric(oropharynx$Education_High_School)/1000
+oropharynx$Education_Bachelors <- as.numeric(oropharynx$Education_Bachelors)/1000
+oropharynx$Below_Poverty <- as.numeric(oropharynx$Below_Poverty)/1000
+oropharynx$Unemployed <- as.numeric(oropharynx$Unemployed)/1000
+oropharynx$std_Median_Household_Income <- log(as.numeric(oropharynx$Median_Household_Income)*10)
+oropharynx$Language_Isolation <- as.numeric(oropharynx$Language_Isolation)/1000
+```
+
+### AJCC Stage
+
+By looking at the AJCC Stage, we can find that survival rate could be highly affected by standard therapy, and shows difference between stages. 
+
+```{r fig.height = 6}
+cbp_Standard_Therapy <- c("#FFCC33", "#66CC00")
+cbp_Vital_Status <- c("#FFCC99", "#33CCFF")
+
+Stage_no_ST <- oropharynx %>% filter(Standard_Therapy == "Not Standard") %>% 
+  group_by(AJCC_Stage, Vital_Status) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n), lbl = scales::percent(pct)) %>% 
+  ggplot(aes(AJCC_Stage, pct, fill = Vital_Status)) + 
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  geom_text(aes(label = lbl), size = 3, position = position_stack(vjust = 0.5)) + 
+  labs(x = "AJCC Stage", y = "Percentage", title = "Survival without Standard Therapy") + 
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  coord_flip()
+# Stage_no_ST
+
+
+Stage_ST <- oropharynx %>% filter(Standard_Therapy == "Standard") %>% 
+  group_by(AJCC_Stage, Vital_Status) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n), lbl = scales::percent(pct)) %>% 
+  ggplot(aes(AJCC_Stage, pct, fill = Vital_Status)) + 
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  geom_text(aes(label = lbl), size = 3, position = position_stack(vjust = 0.5)) + 
+  labs(x = "AJCC Stage", y = "Percentage", title = "Survival after Standard Therapy") + 
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  coord_flip()
+# Stage_ST
+
+grid.arrange(Stage_no_ST, Stage_ST, nrow = 2)
+```
+
+### Race and Region
+
+The data used in this report contains 4 different states and 5 races. However, the sample number is highly unbalanced between states and races. Most of the patients are White people, and high percent of them come from California.
+
+```{r fig.height = 4}
+Race_Cancer <- ggplot(oropharynx, aes(Race, fill = Race)) +
+  geom_bar() + 
+  ylim(0, 9000) +
+  ylab("Count") +
+  facet_wrap(~Region) +
+  ggtitle("Count by Race") +
+  geom_text(stat='count', aes(label=..count..), size = 3, hjust= -0.1) + 
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  coord_flip()
+```
+
+
+```{r fig.height = 4}
+Region_st <- oropharynx %>% 
+  group_by(Region, Race, Standard_Therapy) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n), lbl = scales::percent(pct)) %>% 
+  ggplot(aes(Race, pct, fill = Standard_Therapy)) + 
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = cbp_Standard_Therapy ) +
+  geom_text(aes(label = lbl), size = 3, position = position_stack(vjust = 0.5)) + 
+  labs(x = "Race", y = "Percentage", title = "Standard Therapy By Region") + 
+  facet_wrap(~ Region) +
+  theme_bw() + 
+  theme(legend.position = "bottom") +
+  coord_flip()
+```
+
+When we look at the survival rate, we can find much difference between four states, but with consistence that Black people get lower survival rate.
+
+```{r fig.height = 4}
+oropharynx %>% filter(Standard_Therapy == "Not Standard") %>%
+  group_by(Region, Race, Vital_Status) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n), lbl = scales::percent(pct)) %>% 
+  ggplot(aes(Race, pct, fill = Vital_Status)) + 
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  geom_text(aes(label = lbl), size = 3, position = position_stack(vjust = 0.5)) + 
+  labs(x = "Race", y = "Percentage", title = "Survival without Standard Therapy By Region") + 
+  facet_wrap(~ Region) +
+  theme_bw() + 
+  theme(legend.position = "bottom") +
+  coord_flip()
+
+oropharynx %>% filter(Standard_Therapy == "Standard") %>%
+  group_by(Region, Race, Vital_Status) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n), lbl = scales::percent(pct)) %>% 
+  ggplot(aes(Race, pct, fill = Vital_Status)) + 
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  geom_text(aes(label = lbl), size = 3, position = position_stack(vjust = 0.5)) + 
+  labs(x = "Race", y = "Percentage", title = "Survival after Standard Therapy By Region") + 
+  facet_wrap(~ Region) +
+  theme_bw() + 
+  theme(legend.position = "bottom") +
+  coord_flip()
+```
+
+\newpage
+
+## Regression
+
+Based on the EDA, we removed Race as Unknown Race and American Indian/Alaska Native, Region as Alaska. 
+
+We fit logistic regression for the Standard Therapy and Survival Status, with baseline set at Insured white male with age of 60 from California, take the AJCC Stage, Gender, States, Race, Age, Insurance, Percentage of receiving High School Education, Percentage of Unemployed, Income situation, Language Isolation and Standard Therapy(for SurvivaL Status) as our predictors. The Percentage of receiving High School Education, Unemployed and Language Isolation are at 10% scale, Income is at log scale.
+
+```{r}
+# age 60
+# male/white/Insured
+# survival model
+# filp the color of index
+
+# options(scipen = 200)
+oropharynx$std_Age <- (oropharynx$Age - 60)/10
+oropharynx <- filter(oropharynx, Race != "Unknown Race" & Race != "American Indian/Alaska Native" & Region != "Alaska" & Insurance != "Blank(s)")
+```
+
+The regression results show that Black People have less chance to get standard therapy, compared to White people, while Asian or Pacific Islander have larger chance. Higher income level indicates higher probability to take standard therapy. AJCC Stages also have a large impact on therapy. Compared with Stage I, other stages have less chance to get standard therapy, especially for stage III and IV. 
+
+```{r fig.height = 4}
+# "Education_High_School(10%)", "Below_Poverty(10%)", "Unemployed(10%)", "Median_Household_Income", "Language_Isolation"
+fit1 <- glm(Standard_Therapy ~ AJCC_Stage + Sex + Region + Race + std_Age + Insurance + Education_High_School + Unemployed + std_Median_Household_Income + Language_Isolation, data = oropharynx, family = binomial(link = "logit"))
+
+ggcoef(fit1, exclude_intercept = TRUE) + ggtitle("Regression - Standard Therapy") + ylab("") + xlab("")
+```
+
+Standard therapy suggestion has large impact on survival results of patients. In this report, the standard therapy we used for analysis is based on suggestion, however, patients might refuse suggested therapies. This means, compared with other therapies, standard suggestion gives patients larger survival probability. Gender shows some difference here. Compared with male, female tell lower chance to survive. Black People also show lower survival probability than White people. Income level gives positive impact on survival rate. Higher income level shows higher survival chance. Compared with insuranced people, patients without insurance has less chance to survive. AJCC Stages show some regular here. Except stage II, the higher the stage is, the lower the survival probability will be.
+
+```{r fig.height = 4}
+fit2 <- glm(Vital_Status ~ AJCC_Stage + Sex + Region + Race + std_Age + Insurance + Standard_Therapy +  Education_High_School + Unemployed + std_Median_Household_Income + Language_Isolation, data = oropharynx, family = binomial)
+
+
+
+ggcoef(fit2, exclude_intercept = TRUE) + ggtitle("Regression - Survival") + ylab("") + xlab("")
+```
+
+
+## Conclusion and Discussion
+
+From EDA and regression results, we think that for oropharynx, discrimination exist in Gender, Race, Insurance and Income. Black people, female and uninsured patients show significant lower chance of taking standard therapy and getting survived, while higher income level shows significant higher chance of taking standard therapy and getting survived. 
+
+However, we have a lot of limitations come with the data and for the analysis. Oropharyngeal cancer require p16 index to tell the standard therapy at Stage III. Without these information, the only choice we have is to exclude these samples. This exclusion will add bias to our results. 
+
+The interaction between states and some predictors, like race and income, might give better explanation to the impact source. But given the missing factors in some states, we can not dig into the interactions. In addition, the unbalanced sample size also add some uncertainty to our results, since most of the samples are collects from California. Its doubtful that whether California has a good representative for all four states.
+
+\newpage
+
+## Appendix
+
+### AJCC Stages - TMN Stages
+
+By removing the Blank(s) in both AJCC Stage and Tumor size, we get 20157 observations, with 8637 Blanks in AJCC Stage.
+
+According CS code, we try to determine the TNM Stage for each patient. By this step, we aim to:
+
+(1) Involve the patients with blanks in AJCC Stage information.
+
+(2) Exclude the patients at Stage III while T Stage is 1 and N Stage is 1. (We can not tell whether the patient was given a standard therapy because we don't have p16-test result)
+
+The dataset provides lymph nodes code but no nodes size, we can not distinguish N0-N3, we can only tell `N0`: No Nodal Involvement, `NX` or `Other`: Nodal Involvement (N1-N3).
+
+According to the mets code we determine the M Stage as:  
+`M0`: No distant metastasis and,  
+`M1`: Distant metastasis  .
+
+With limited lymph nodes information, the AJCC Stage is difficult to tell between III and IV for some patients. After assign AJCC Stage for the patients, we exclude the Unknown Stages, IVNOS and unsure stages. Now we have 13696 observations for further analysis. 
+
+### Standard Therapy
+
+  `Radiation`: "None/Unknown" or "Recommended" (All other recording besides None/Unknown)
+  `Surgery`: "Not recommended" or "Recommended" (All other recording besides Not recommended or Not recommended, contraindicated due to other cond; autopsy only (1973-2002))
+  `Chemotherapy`: "No/Unknown" or "Yes"
+  
+According to NCCN Clinical Practice Guidelines(Version 1.2020), we defined the standard therapy for each stage:
+
+  - Stage I: Either Radiation or Surgery  
+  - Stage II: Either Radiation or Surgery  
+  - Stage III:   
+  `T1`: (removed, need hpv test information)   
+  `T2`: Radiation and Chemotherapy   
+  `T3`: Radiation and Chemotherapy, or Surgery  
+  - Stage IV: Radiation and Chemotherapy, or Surgery  
+
+This Standard therapy is based on suggestion. (Patients might refuse some therapies)
+
+The standard therapy is a binary variable where `0` indicates `Not Get Standard Therapy` while `1` indicates the patient `Get Standard Therapy`.
+
+```{r}
+# table(oropharynx$Standard_Therapy)
+```
+
+### EDA
+
+In this part I will include more EDA plots.
+
+- **Gender**
+
+```{r fig.height = 4}
+# Gender
+Gender_Cancer <- ggplot(oropharynx, aes(Sex, fill = Sex)) +
+  geom_bar() + 
+  geom_text(stat='count', aes(label=..count..), size = 3, position = position_stack(vjust = 0.5)) + 
+  ylab("Count by Gender") +
+  ggtitle("Oropharynx") +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  coord_flip()
+Gender_Cancer 
+
+oropharynx %>% 
+  group_by(Sex, Standard_Therapy) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n), lbl = scales::percent(pct)) %>% 
+  ggplot(aes(Sex, pct, fill = Standard_Therapy)) + 
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = cbp_Standard_Therapy ) +
+  geom_text(aes(label = lbl), size = 3, position = position_stack(vjust = 0.5)) + 
+  labs(x = "Gender", y = "Percentage", title = "Standard Therapy") + 
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  coord_flip()
+# Male: 0.108
+# Female: 0.110
+
+oropharynx %>% 
+  group_by(Sex, Vital_Status) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n), lbl = scales::percent(pct)) %>% 
+  ggplot(aes(Sex, pct, fill = Vital_Status)) + 
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  geom_text(aes(label = lbl), size = 3, position = position_stack(vjust = 0.5)) + 
+  labs(x = "Gender", y = "Percentage", title = "Survival") + 
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  coord_flip()
+
+
+oropharynx %>% filter(Standard_Therapy == "Not Standard") %>% 
+  group_by(Sex, Vital_Status) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n), lbl = scales::percent(pct)) %>% 
+  ggplot(aes(Sex, pct, fill = Vital_Status)) + 
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  geom_text(aes(label = lbl), size = 3, position = position_stack(vjust = 0.5)) + 
+  labs(x = "Gender", y = "Percentage", title = "Survival without Standard Therapy") + 
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  coord_flip()
+
+oropharynx %>% filter(Standard_Therapy == "Standard") %>% 
+  group_by(Sex, Vital_Status) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n), lbl = scales::percent(pct)) %>% 
+  ggplot(aes(Sex, pct, fill = Vital_Status)) + 
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  geom_text(aes(label = lbl), size = 3, position = position_stack(vjust = 0.5)) + 
+  labs(x = "Gender", y = "Percentage", title = "Survival after Standard Therapy") + 
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  coord_flip()
+
+```
+
+- **Race and Region**
+
+The rates of giving standard therapy are similar between states for White, Black and Hispanic people, but much different for American Indian/Alaska Native and Asian or Pacific Islander.
+
+```{r fig.height = 4}
+# Race
+Race_Cancer 
+
+Region_st
+
+oropharynx %>% 
+  group_by(Race, Standard_Therapy) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n), lbl = scales::percent(pct)) %>% 
+  ggplot(aes(Race, pct, fill = Standard_Therapy)) + 
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = cbp_Standard_Therapy ) +
+  geom_text(aes(label = lbl), size = 3, position = position_stack(vjust = 0.5)) + 
+  labs(x = "Race", y = "Percentage", title = "Standard Therapy") + 
+  theme_bw() + 
+  theme(legend.position = "bottom") +
+  coord_flip()
+
+# Region
+Registry_Cancer <- ggplot(oropharynx, aes(Region, fill = Region)) +
+  geom_bar() + 
+  ylab("Count") +
+  geom_text(stat='count', aes(label=..count..), size = 3, position = position_stack(vjust = 0.5)) + 
+  ggtitle("Count By Cancer and Region") +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  coord_flip()
+Registry_Cancer
+
+oropharynx %>% 
+  group_by(Region, Standard_Therapy) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n), lbl = scales::percent(pct)) %>% 
+  ggplot(aes(Region, pct, fill = Standard_Therapy)) + 
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = cbp_Standard_Therapy ) +
+  geom_text(aes(label = lbl), size = 3, position = position_stack(vjust = 0.5)) + 
+  labs(x = "Region", y = "Percentage", title = "Standard Therapy") + 
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  coord_flip()
+
+# Interaction
+# errorbar
+```
+
+- **Insurance**
+
+```{r fig.height = 4}
+# Insurance
+Insurance_Cancer <- ggplot(oropharynx, aes(Insurance, fill = Insurance)) +
+  geom_bar() + 
+  geom_text(stat='count', aes(label=..count..), size = 3, position = position_stack(vjust = 0.5)) + 
+  ggtitle("Count By Insurance") +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  coord_flip()
+Insurance_Cancer 
+
+oropharynx %>% 
+  group_by(Insurance, Standard_Therapy) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n), lbl = scales::percent(pct)) %>% 
+  ggplot(aes(Insurance, pct, fill = Standard_Therapy)) + 
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = cbp_Standard_Therapy) +
+  geom_text(aes(label = lbl), size = 3, position = position_stack(vjust = 0.5)) + 
+  labs(x = "Insurance", y = "Percentage", title = "Standard Therapy") + 
+  theme_bw() + 
+  theme(legend.position = "bottom") +
+  coord_flip()
+#0.107|0.108
+
+
+oropharynx %>% filter(Standard_Therapy == "Not Standard") %>%
+  group_by(Insurance, Vital_Status) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n), lbl = scales::percent(pct)) %>% 
+  ggplot(aes(Insurance, pct, fill = Vital_Status)) + 
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  geom_text(aes(label = lbl), size = 3, position = position_stack(vjust = 0.5)) + 
+  labs(x = "Insurance", y = "Percentage", title = "Survival without Standard Therapy By Region") + 
+  theme_bw() + 
+  theme(legend.position = "bottom") +
+  coord_flip()
+
+oropharynx %>% filter(Standard_Therapy == "Standard") %>%
+  group_by(Insurance, Vital_Status) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = n/sum(n), lbl = scales::percent(pct)) %>% 
+  ggplot(aes(Insurance, pct, fill = Vital_Status)) + 
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  geom_text(aes(label = lbl), size = 3, position = position_stack(vjust = 0.5)) + 
+  labs(x = "Insurance", y = "Percentage", title = "Survival after Standard Therapy By Region") + 
+  theme_bw() + 
+  theme(legend.position = "bottom") +
+  coord_flip()
+```
+
+- **Age**
+
+From the Age plots, we can find that patients who are getting standard therapy and survival are younger than patients who are not getting standard therapy, and not survived.
+
+```{r fig.height = 4}
+# Age
+# summary(oropharynx$Age)
+Age_Gender <- ggplot(oropharynx, aes(Age, fill = Sex)) +
+  geom_density(alpha = 0.3) +
+  ylab("Density") +
+  ggtitle("By Gender") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Age_Gender
+
+Age_Race <- ggplot(filter(oropharynx, Race != "Unknown Race"), aes(Age, fill = Race)) +
+  geom_density(alpha = 0.3) +
+  ylab("Density") +
+  ggtitle("By Race") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Age_Race
+
+Age_ST <- ggplot(oropharynx, aes(Age, fill = Standard_Therapy)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Standard_Therapy) +
+  ylab("Density") +
+  ggtitle("Standard Therapy") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Age_ST 
+
+Age_SV <- ggplot(oropharynx, aes(Age, fill = Vital_Status, group = Vital_Status)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  ylab("Density") +
+  ggtitle("Survival") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Age_SV
+
+library(ggridges)
+Age_SV_Race <- ggplot(filter(oropharynx, Race != "Unknown Race"), aes(x = Age, y = Race, fill = Vital_Status, alpha = 0.3)) +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  geom_density_ridges() +
+  theme_ridges()  +
+  facet_wrap(~ Standard_Therapy) +
+  theme(legend.position = "bottom")
+Age_SV_Race
+```
+
+- **Education, Income and Language**
+
+In these plots, education, language and unemployment are at 10% scale, income are at log scale. From these plots, we didn't find obvious difference between different treatment and survival status.
+
+```{r fig.height = 4}
+Education_9th_Grade_ST <- ggplot(oropharynx, aes(Education_9th_Grade, fill = Vital_Status)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  ylab("Density 9th Grade") +
+  ggtitle("9th Grade Education by Survival") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Education_9th_Grade_ST 
+
+Education_High_School_ST <- ggplot(oropharynx, aes(Education_High_School, fill = Vital_Status)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  ylab("Density High School") +
+  ggtitle("High School Education by Survival") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Education_High_School_ST 
+
+Education_Bachelors_ST <- ggplot(oropharynx, aes(Education_Bachelors, fill = Vital_Status)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  ylab("Density Bachelors") +
+  ggtitle("Bachelors Dregree by Survival") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Education_Bachelors_ST 
+
+Below_Poverty_ST <- ggplot(oropharynx, aes(Below_Poverty, fill = Vital_Status)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  ylab("Density Below Poverty") +
+  ggtitle("Below Poverty by Survival") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Below_Poverty_ST 
+
+Unemployed_ST <- ggplot(oropharynx, aes(Unemployed, fill = Vital_Status)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  ylab("Density Unemployed") +
+  ggtitle("Unemployed by Survival") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Unemployed_ST 
+
+Median_Household_Income_ST <- ggplot(oropharynx, aes(std_Median_Household_Income, fill = Vital_Status)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  ylab("Density Median Household Income") +
+  ggtitle("Median Household Income by Survival") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Median_Household_Income_ST 
+
+Language_Isolation_ST <- ggplot(oropharynx, aes(Language_Isolation, fill = Vital_Status)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Vital_Status) +
+  ylab("Density Language Isolation") +
+  ggtitle("Language Isolation by Survival") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Language_Isolation_ST 
+
+```
+
+```{r fig.height = 4}
+Education_9th_Grade_ST <- ggplot(oropharynx, aes(Education_9th_Grade, fill = Standard_Therapy)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Standard_Therapy) +
+  ylab("Density 9th Grade") +
+  ggtitle("9th Grade Education by Standard Treatment") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Education_9th_Grade_ST 
+
+Education_High_School_ST <- ggplot(oropharynx, aes(Education_High_School, fill = Standard_Therapy)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Standard_Therapy) +
+  ylab("Density High School") +
+  ggtitle("High School Education by Standard Treatment") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Education_High_School_ST 
+
+Education_Bachelors_ST <- ggplot(oropharynx, aes(Education_Bachelors, fill = Standard_Therapy)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Standard_Therapy) +
+  ylab("Density Bachelors") +
+  ggtitle("Bachelors Degree by Standard Treatment") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Education_Bachelors_ST 
+
+Below_Poverty_ST <- ggplot(oropharynx, aes(Below_Poverty, fill = Standard_Therapy)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Standard_Therapy) +
+  ylab("Density Below Poverty") +
+  ggtitle("Below Poverty by Standard Treatment") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Below_Poverty_ST 
+
+Unemployed_ST <- ggplot(oropharynx, aes(Unemployed, fill = Standard_Therapy)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Standard_Therapy) +
+  ylab("Density Unemployed") +
+  ggtitle("Unemployed by Standard Treatment") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Unemployed_ST 
+
+Median_Household_Income_ST <- ggplot(oropharynx, aes(std_Median_Household_Income, fill = Standard_Therapy)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Standard_Therapy) +
+  ylab("Density Median Household Income") +
+  ggtitle("Median Household Income by Standard Treatment") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Median_Household_Income_ST 
+
+Language_Isolation_ST <- ggplot(oropharynx, aes(Language_Isolation, fill = Standard_Therapy)) +
+  geom_density(alpha = 0.3) +
+  scale_fill_manual(values = cbp_Standard_Therapy) +
+  ylab("Density Language Isolation") +
+  ggtitle("Language Isolation by Standard Treatment") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+Language_Isolation_ST 
+
+```
+
+### Model Check
+
+- **Standard Therapy**
+
+```{r fig.height = 4}
+summary(fit1) # ? exclude IVC because of the standard theorapy is high.
+
+pred <- predict(fit1)
+resid <- residuals(fit1, type = "response")
+binnedplot(pred, resid)
+
+# Calibration Plot
+oropharynx$pred_st <- predict.glm(fit1, type = 'response')
+oropharynx$st <-as.numeric(oropharynx$Standard_Therapy)-1
+calibration_plot(data = oropharynx, obs = "st", pred = "pred_st", title = "Calibration plot for Standard Therapy", group = "AJCC_Stage")
+# C Statistic:(Area Under the ROC Curve)
+cat("C Statistic = ", Cstat(fit1), "\n")
+```
+
+- **Survival**
+
+```{r fig.height = 4}
+summary(fit2)
+
+pred <- predict(fit2)
+resid <- residuals(fit2, type = "response")
+binnedplot(pred, resid)
+
+# Calibration Plot
+oropharynx$pred_sv <- predict.glm(fit2, type = 'response')
+oropharynx$sv <-as.numeric(oropharynx$Vital_Status)-1
+calibration_plot(data = oropharynx, obs = "sv", pred = "pred_sv", title = "Calibration plot for Survival", group = "Race")
+
+# C Statistic:(Area Under the ROC Curve)
+cat("C Statistic = ", Cstat(fit2), "\n")
+```
+
+- **Matching**
+
+```{r}
+### Casual Inference in Standard Treatment
+
+# Treatment: Standard Treatment
+# Confunders: Sex, Region, Race, Age, Insurance, AJCC_Stage
+# Matching -> unbiased estimate
+
+# fit2 <- glm(Vital_Status ~ AJCC_Stage + Sex + Region + Race + std_Age + Insurance + Standard_Therapy +  Education_High_School + Unemployed + std_Median_Household_Income + Language_Isolation, data = oropharynx, family = binomial)
+
+library(MatchIt)
+match.exact <- matchit(Vital_Status ~ AJCC_Stage + Sex + Region + Race + std_Age + Insurance + Education_High_School + Unemployed + std_Median_Household_Income + Language_Isolation, data = oropharynx, method = "nearest")
+matched.data <- match.data(match.exact)
+
+model.matched <- glm(Vital_Status ~ AJCC_Stage + Sex + Region + Race + std_Age + Insurance + Standard_Therapy +  Education_High_School + Unemployed + std_Median_Household_Income + Language_Isolation, data = matched.data, weights = weights, family = binomial)
+summary(model.matched)
+ggcoef(model.matched, exclude_intercept = TRUE) + ggtitle("Matching - Regression - Survival") + ylab("") + xlab("") + xlim(-20,10)
+# strange error bar for AJCC Stage IVC
+```
